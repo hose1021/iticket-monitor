@@ -32,6 +32,14 @@ const AI_ENDPOINT = "https://opencode.ai/zen/go/v1/responses";
 const AI_MODEL = process.env.AI_MODEL || "muse-spark-1.3-contributor";
 const AI_SESSION = "iticket-monitor-sabah-barcelona-25-11-2026";
 
+// One failure report per distinct error per window, so a broken run cannot flood Telegram.
+const ERROR_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+
+// Local name filter: it decides when an AI call is worth making, and it is the safety
+// net when the model misses an event that names both clubs.
+const SABAH_IDS = ["sabah fk", "sabah fc", "сабах"];
+const BARCELONA_IDS = ["barcelona", "барселона"];
+
 const SYSTEM_PROMPT = [
   "You read an event list from iTicket.az, a ticket shop in Azerbaijan.",
   `Decide if the list holds a football match between Sabah and FC Barcelona on ${TARGET_DATE}.`,
@@ -119,6 +127,43 @@ async function fetchAllEvents() {
 }
 
 /* ---------- AI decider ---------- */
+
+const normalize = (value) => value.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "-");
+
+function collectStrings(value, out = []) {
+  if (typeof value === "string") {
+    out.push(value);
+  } else if (Array.isArray(value)) {
+    for (const item of value) collectStrings(item, out);
+  } else if (value !== null && typeof value === "object") {
+    for (const item of Object.values(value)) collectStrings(item, out);
+  }
+  return out;
+}
+
+// Hyphen sentinels give whole-token matching, so "sabah-fkx" cannot match.
+function eventText(event) {
+  if (event === null || typeof event !== "object" || Array.isArray(event)) return "";
+  return `-${collectStrings(event).map(normalize).join("-")}-`;
+}
+
+const mentions = (haystack, ids) => ids.some((id) => haystack.includes(`-${normalize(id)}-`));
+
+// A match needs the Sabah name somewhere and the Barcelona name somewhere; that is
+// enough to justify a model call. `both` holds the events that already name both
+// clubs in one record, which is what the safety net relies on.
+function scanCandidates(events) {
+  const found = { sabah: null, barcelona: null, both: [] };
+  for (const event of events) {
+    const haystack = eventText(event);
+    const hasSabah = mentions(haystack, SABAH_IDS);
+    const hasBarcelona = mentions(haystack, BARCELONA_IDS);
+    if (hasSabah && found.sabah === null) found.sabah = String(event?.name ?? event?.id ?? "?");
+    if (hasBarcelona && found.barcelona === null) found.barcelona = String(event?.name ?? event?.id ?? "?");
+    if (hasSabah && hasBarcelona) found.both.push(event);
+  }
+  return found;
+}
 
 // Flat digest: one short record per event keeps the prompt small and keeps the
 // "both clubs in the same event" boundary visible to the model.
@@ -330,16 +375,50 @@ function loadState() {
   try {
     const parsed = JSON.parse(readFileSync(STATE_FILE, "utf8"));
     const ids = Array.isArray(parsed?.notifiedEventIds) ? parsed.notifiedEventIds.map(String) : [];
-    return { notifiedEventIds: [...new Set(ids)] };
+    const lastError = typeof parsed?.lastError?.signature === "string"
+      ? { signature: parsed.lastError.signature, sentAt: String(parsed.lastError.sentAt ?? "") }
+      : null;
+    return { notifiedEventIds: [...new Set(ids)], lastError };
   } catch (error) {
     // A reset loses dedupe history at worst, so a corrupt file must not stop the monitor.
     if (error.code !== "ENOENT") warn(`[WARN] Cannot read ${STATE_FILE} (${error.message}); starting empty`);
-    return { notifiedEventIds: [] };
+    return { notifiedEventIds: [], lastError: null };
   }
 }
 
 function saveState(state) {
   writeFileSync(STATE_FILE, `${JSON.stringify(state, null, 2)}\n`);
+}
+
+// Ids, status codes and request ids vary between identical failures, so the cooldown
+// key keeps only the words. Distinct error kinds still differ.
+const errorSignature = (text) => text.replace(/[^\p{L}\s]+/gu, " ").replace(/\s+/g, " ").trim().toLowerCase().slice(0, 120);
+
+function shouldReportError(state, signature, now) {
+  const last = state.lastError;
+  if (!last || last.signature !== signature) return true;
+  const sentAt = Date.parse(last.sentAt);
+  return !Number.isFinite(sentAt) || now - sentAt >= ERROR_COOLDOWN_MS;
+}
+
+async function reportFailure(text) {
+  try {
+    const state = loadState();
+    const signature = errorSignature(text);
+    const now = Date.now();
+    if (!shouldReportError(state, signature, now)) {
+      log("[ALERT] Same failure already reported, skipping");
+      return;
+    }
+
+    await sendTelegram(`iTicket monitor failed\n\n${text}\n\n${new Date(now).toISOString()}`);
+    state.lastError = { signature, sentAt: new Date(now).toISOString() };
+    saveState(state);
+    log("[ALERT] Failure reported to Telegram");
+  } catch (error) {
+    // Never mask the original failure: a broken alert channel must not change the exit code path.
+    warn(`[WARN] Could not report the failure: ${redact(error)}`);
+  }
 }
 
 /* ---------- run ---------- */
@@ -356,7 +435,7 @@ async function notifyNewMatches(matched, state) {
       continue;
     }
 
-    if (!message) warn(`[WARN] AI message for event ${id} is missing or holds no iTicket event link; using the built-in template`);
+    if (!message) warn(`[WARN] No usable AI message for event ${id}; using the built-in template`);
     log(`[MATCH] ID: ${id} Date: ${event.event_starts_at ?? "unknown"}`);
     log("[ALERT] Sending Telegram notification");
     await sendTelegram(message ?? buildMessage(event));
@@ -371,15 +450,46 @@ async function main() {
   const state = loadState();
   try {
     const events = await fetchAllEvents();
-    const verdict = await askModel(events);
-    if (!verdict.match) {
+    const candidates = scanCandidates(events);
+
+    // Without both names in the list no match is possible, so the AI call is pointless.
+    if (candidates.sabah === null || candidates.barcelona === null) {
+      log(`[CHECK] Filter found no Sabah and Barcelona pair (sabah: ${candidates.sabah ?? "none"}, barcelona: ${candidates.barcelona ?? "none"}), AI call skipped`);
       log("[CHECK] No matching event");
       return;
     }
-    if (verdict.reason) log(`[AI] Reason: ${verdict.reason}`);
-    await notifyNewMatches(verdict.matched, state);
+    log(`[CHECK] Filter found sabah "${candidates.sabah}" and barcelona "${candidates.barcelona}"`);
+
+    const verdict = await askModel(events);
+    if (verdict.match) {
+      if (verdict.reason) log(`[AI] Reason: ${verdict.reason}`);
+      await notifyNewMatches(verdict.matched, state);
+      return;
+    }
+
+    // Safety net: the list names both clubs in one event, so the "no match" answer is
+    // not trusted. The built-in template goes out instead of losing the ticket.
+    if (candidates.both.length > 0) {
+      warn(`[WARN] AI reported no match, but ${candidates.both.length} event(s) name both clubs; sending the built-in template`);
+      await notifyNewMatches(candidates.both.map((event) => ({ event, message: null })), state);
+      return;
+    }
+
+    log("[CHECK] No matching event");
   } finally {
     saveState(state);
+  }
+}
+
+async function runScheduled() {
+  log("[CHECK] Starting iTicket check");
+  try {
+    await main();
+  } catch (error) {
+    const text = redact(error);
+    warn(`[ERROR] ${text}`);
+    await reportFailure(text);
+    process.exitCode = 1;
   }
 }
 
@@ -438,6 +548,25 @@ function runSelfTest() {
   }), '{"match":false}');
   check("reasoning only yields no text", extractOutputText({ output: [{ type: "reasoning" }] }), null);
   check("empty payload yields no text", extractOutputText({}), null);
+
+  const scanAll = scanCandidates([MATCH_FIXTURE, ...DECOYS]);
+  check("filter finds both clubs in one event", scanAll.both.length, 1);
+  check("filter names the sabah event", scanAll.sabah, "Sabah FK - FC Barcelona");
+  check("filter accepts a cyrillic pair", scanCandidates([{ id: 11, name: "Сабах - Барселона" }]).both.length, 1);
+  const split = scanCandidates([DECOYS[0], DECOYS[1]]);
+  check("separate events are plausible but no candidate", [split.sabah !== null, split.barcelona !== null, split.both.length], [true, true, 0]);
+  check("barcelona only is not plausible", scanCandidates([DECOYS[2]]).sabah, null);
+  check("substring does not count", scanCandidates([{ id: 12, name: "Sabah FK - Barcelonax Cup" }]).both.length, 0);
+  check("empty list is not plausible", scanCandidates([]).barcelona, null);
+
+  const now = Date.now();
+  const signature = errorSignature("AI HTTP 500 Internal Server Error: req_123");
+  check("signature ignores ids", errorSignature("AI HTTP 500 Internal Server Error: req_999"), signature);
+  check("signature separates error kinds", errorSignature("Telegram API failed 401 Unauthorized") === signature, false);
+  check("first failure is reported", shouldReportError({ lastError: null }, signature, now), true);
+  check("repeat inside the window is suppressed", shouldReportError({ lastError: { signature, sentAt: new Date(now - 60_000).toISOString() } }, signature, now), false);
+  check("repeat after the window is reported", shouldReportError({ lastError: { signature, sentAt: new Date(now - ERROR_COOLDOWN_MS - 1).toISOString() } }, signature, now), true);
+  check("a different failure is reported", shouldReportError({ lastError: { signature: "other", sentAt: new Date(now).toISOString() } }, signature, now), true);
 
   const all = [MATCH_FIXTURE, ...DECOYS];
   const link = "https://iticket.az/ru/events/sport/sabah-fk-fc-barcelona";
@@ -514,8 +643,7 @@ try {
   } else if (process.env.TEST_EVENT_JSON) {
     await runOfflineCheck(process.env.TEST_EVENT_JSON);
   } else {
-    log("[CHECK] Starting iTicket check");
-    await main();
+    await runScheduled();
   }
 } catch (error) {
   warn(`[ERROR] ${redact(error)}`);

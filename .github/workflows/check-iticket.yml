@@ -1,0 +1,50 @@
+name: iTicket Sabah - Barcelona monitor
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: iticket-sabah-barcelona-monitor
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # Cache keys are immutable, so each run claims a unique key and restores
+      # the newest entry through the shared prefix.
+      - name: Restore notified-event state
+        uses: actions/cache/restore@v4
+        with:
+          path: .iticket-state.json
+          key: iticket-notified-${{ github.run_id }}
+          restore-keys: |
+            iticket-notified-
+
+      - name: Check iTicket
+        run: node check-iticket.mjs
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      - name: Save notified-event state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .iticket-state.json
+          key: iticket-notified-${{ github.run_id }}

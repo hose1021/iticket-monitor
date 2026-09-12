@@ -1,13 +1,21 @@
 name: iTicket Sabah - Barcelona monitor
 
+# GitHub delivers `schedule` on a best-effort, lowest-priority queue: the former
+# `*/5` cron arrived every 2-4 hours. One long-lived job polls on its own clock
+# instead, so the cron only has to land often enough to restart the loop.
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "0 * * * *"
   workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Polling window in minutes (the job times out at 358)"
+        default: "350"
 
 permissions:
   contents: read
 
+# A delivered tick takes the loop over instead of queueing behind it.
 concurrency:
   group: iticket-sabah-barcelona-monitor
   cancel-in-progress: true
@@ -15,7 +23,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 358
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -35,12 +43,20 @@ jobs:
           restore-keys: |
             iticket-notified-
 
-      - name: Check iTicket
-        run: node check-iticket.mjs
+      - name: Poll iTicket every 5 minutes
         env:
+          WINDOW_MINUTES: ${{ inputs.minutes || '350' }}
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          deadline=$(( $(date +%s) + WINDOW_MINUTES * 60 ))
+          while :; do
+            # A failed check reports itself through Telegram; the loop outlives it.
+            node check-iticket.mjs || echo "[WARN] check exited $?"
+            [ "$(date +%s)" -lt "$deadline" ] || break
+            sleep 300
+          done
 
       - name: Save notified-event state
         if: always()

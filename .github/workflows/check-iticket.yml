@@ -1,8 +1,9 @@
 name: iTicket Sabah - Barcelona monitor
 
 # GitHub delivers `schedule` on a best-effort, lowest-priority queue: the former
-# `*/5` cron arrived every 2-4 hours. One long-lived job polls on its own clock
-# instead, so the cron only has to land often enough to restart the loop.
+# `*/5` cron arrived every 2-4 hours. One long-lived job polls on its own clock;
+# at the end of its window it dispatches the next one, chaining around the clock
+# even when every cron tick is dropped. The hourly cron is only a backstop.
 on:
   schedule:
     - cron: "0 * * * *"
@@ -14,6 +15,7 @@ on:
 
 permissions:
   contents: read
+  actions: write
 
 # A delivered tick takes the loop over instead of queueing behind it.
 concurrency:
@@ -57,6 +59,14 @@ jobs:
             [ "$(date +%s)" -lt "$deadline" ] || break
             sleep 300
           done
+
+      # `gh workflow run` from GITHUB_TOKEN is the documented dispatch exception.
+      - name: Chain the next window
+        if: always() && !cancelled()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WINDOW_MINUTES: ${{ inputs.minutes || '350' }}
+        run: gh workflow run check-iticket.yml -f minutes="$WINDOW_MINUTES"
 
       - name: Save notified-event state
         if: always()

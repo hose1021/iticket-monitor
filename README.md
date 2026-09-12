@@ -10,7 +10,8 @@ No browser, no scraping, no npm dependencies — Node 22 built-ins only.
 ## Files
 
 - `check-iticket.mjs` — fetch, filter, AI verdict, Telegram.
-- `.github/workflows/check-iticket.yml` — the monitor, cron `*/5 * * * *` + `workflow_dispatch`.
+- `.github/workflows/check-iticket.yml` — the monitor: an hourly cron restarts a long-lived
+  job that polls every 5 minutes and chains the next window on exit.
 - `.github/workflows/keepalive.yml` — monthly commit, cron `0 3 1 * *` + `workflow_dispatch`.
 
 ## Setup
@@ -134,10 +135,10 @@ monitor would stop around 10.11.2026.
 
 ## Cost
 
-- Public repository: Actions minutes are free. On a **private** repository the 5-minute schedule
-  bills roughly 288 job-minutes per day (~8,900/month) because each job rounds up to a whole
-  minute — that exceeds the Free plan's 2,000 and costs about $47/month on Pro. On a private
-  repository use `*/25` (Free) or `*/15` (Pro).
+- Public repository: Actions minutes are free. On a **private** repository the loop bills
+  ~1,440 job-minutes per day (the runner is occupied by `sleep`), which exceeds the Free plan's
+  2,000/month. A private repository needs an external cron (cron-job.org) calling
+  `repository_dispatch` instead of the long-lived loop.
 - AI: the filter keeps most runs free of AI calls, so the monthly call count depends on how often
   a Sabah name and a Barcelona name coexist in the list. `muse-spark-1.3-contributor` is free on
   Go and reports `Cost: 0`.
@@ -146,4 +147,8 @@ monitor would stop around 10.11.2026.
 
 - **The model decides and writes.** The filter and the safety net protect against a missed match
   and a message without a link, but the final verdict is the model's.
-- GitHub delays scheduled runs under load; `*/5` is a request, not a guarantee.
+- GitHub delays or drops `schedule` runs under load, so the hourly cron is a backstop, not the
+  clock: each window (350 min, under the 6 h job limit) chains the next one through
+  `workflow_dispatch`, the only event `GITHUB_TOKEN` may trigger. Coverage continues 24/7 as long
+  as a window ends normally; a job the runner kills mid-window leaves a gap until the next cron
+  tick — worst case about one hour.

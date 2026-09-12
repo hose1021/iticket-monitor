@@ -60,6 +60,15 @@ jobs:
             sleep 300
           done
 
+      # State is saved first: the chained run cancels this one, and a lost state
+      # file would let an already-notified event reach Telegram a second time.
+      - name: Save notified-event state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .iticket-state.json
+          key: iticket-notified-${{ github.run_id }}
+
       # `gh workflow run` from GITHUB_TOKEN is the documented dispatch exception.
       - name: Chain the next window
         if: always() && !cancelled()
@@ -67,10 +76,3 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           WINDOW_MINUTES: ${{ inputs.minutes || '350' }}
         run: gh workflow run check-iticket.yml -f minutes="$WINDOW_MINUTES"
-
-      - name: Save notified-event state
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: .iticket-state.json
-          key: iticket-notified-${{ github.run_id }}
